@@ -115,8 +115,8 @@ jobs:
           # Accept both a normal dump root and an archive wrapped in one parent directory.
           GAME_ROOT="$WORK/game"
           if [[ ! -d "$GAME_ROOT/updates" && ! -d "$GAME_ROOT/base" && ! -d "$GAME_ROOT/exefs" ]]; then
-            mapfile -t dirs < <(find "$GAME_ROOT" -mindepth 1 -maxdepth 1 -type d)
-            if (( ${#dirs[@]} == 1 )); then GAME_ROOT="${dirs[0]}"; fi
+            dirs=("$GAME_ROOT"/*)
+            if (( ${#dirs[@]} == 1 )) && [[ -d "${dirs[0]}" ]]; then GAME_ROOT="${dirs[0]}"; fi
           fi
           if [[ ! -d "$GAME_ROOT/updates" && ! -d "$GAME_ROOT/base" && ! -d "$GAME_ROOT/exefs" ]]; then
             echo "::error::ZIP must contain nxnative dump layout: updates/<version>/exefs and romfs, or base/exefs and romfs."
@@ -132,10 +132,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "$NXNATIVE_REF" https://github.com/seedds/nxnative.git "$WORK/nxnative" || {
+          if ! git clone --depth 1 --branch "$NXNATIVE_REF" https://github.com/seedds/nxnative.git "$WORK/nxnative"; then
+            rm -rf "$WORK/nxnative"
             git clone https://github.com/seedds/nxnative.git "$WORK/nxnative"
             git -C "$WORK/nxnative" checkout "$NXNATIVE_REF"
-          }
+          fi
           git -C "$WORK/nxnative" rev-parse HEAD
           df -h /
 
