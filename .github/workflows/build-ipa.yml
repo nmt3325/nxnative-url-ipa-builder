@@ -19,6 +19,11 @@ on:
         type: string
         required: false
         default: main
+      preflight_only:
+        description: 'Verify runner and Xcode without downloading ROM or building'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -33,7 +38,7 @@ jobs:
       ROM_ZIP_URL_SECRET: ${{ secrets.ROM_ZIP_URL }}
       ROMFS_MODE: ${{ inputs.romfs_mode }}
       NXNATIVE_REF: ${{ inputs.nxnative_ref }}
-      WORK: ${{ runner.temp }}/nxnative-url-build
+      WORK: ${{ github.workspace }}/nxnative-url-build
     steps:
       - name: Select Xcode 27.2 and inspect disk
         shell: bash
@@ -56,6 +61,7 @@ jobs:
           echo "Workdir: $WORK"
 
       - name: Install build dependencies
+        if: ${{ !inputs.preflight_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -68,6 +74,7 @@ jobs:
           df -h /
 
       - name: Download ROM ZIP (do not publish URL or archive)
+        if: ${{ !inputs.preflight_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -91,6 +98,7 @@ jobs:
           df -h /
 
       - name: Verify and unpack ROM ZIP
+        if: ${{ !inputs.preflight_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -129,6 +137,7 @@ jobs:
           find "$GAME_ROOT" -mindepth 1 -maxdepth 2 -type d | head -30
 
       - name: Clone nxnative
+        if: ${{ !inputs.preflight_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -141,6 +150,7 @@ jobs:
           df -h /
 
       - name: Compile unsigned IPA
+        if: ${{ !inputs.preflight_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -156,9 +166,10 @@ jobs:
           df -h /
 
       - name: Upload IPA only (ROM/ROMFS intentionally excluded)
+        if: ${{ !inputs.preflight_only }}
         uses: actions/upload-artifact@v4
         with:
           name: nxnative-unsigned-ipa
-          path: ${{ runner.temp }}/nxnative-url-build/output/*.ipa
+          path: ${{ github.workspace }}/nxnative-url-build/output/*.ipa
           if-no-files-found: error
           retention-days: 1
