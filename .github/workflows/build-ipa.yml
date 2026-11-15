@@ -1,0 +1,163 @@
+name: Build nxnative IPA from ROM ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_zip_url:
+        description: 'HTTPS URL of YOUR legally obtained ROM ZIP (leave empty to use ROM_ZIP_URL secret)'
+        type: string
+        required: false
+      romfs_mode:
+        description: 'bundle = very large IPA; separate = smaller IPA, transfer RomFS yourself'
+        type: choice
+        options:
+          - separate
+          - bundle
+        default: separate
+      nxnative_ref:
+        description: 'nxnative Git ref (branch, tag, or commit)'
+        type: string
+        required: false
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned iOS IPA
+    runs-on: xcode-27
+    timeout-minutes: 360
+    env:
+      ROM_ZIP_URL_INPUT: ${{ inputs.rom_zip_url }}
+      ROM_ZIP_URL_SECRET: ${{ secrets.ROM_ZIP_URL }}
+      ROMFS_MODE: ${{ inputs.romfs_mode }}
+      NXNATIVE_REF: ${{ inputs.nxnative_ref }}
+      WORK: ${{ runner.temp }}/nxnative-url-build
+    steps:
+      - name: Select Xcode 27.2 and inspect disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "macOS: $(sw_vers -productVersion)"
+          echo "arch: $(uname -m)"
+          echo "Initial disk space:"
+          df -h /
+          test "$(uname -m)" = "arm64" || { echo "::error::An Apple Silicon runner is required"; exit 1; }
+          XCODE_PATH="$(find /Applications -maxdepth 1 -type d -name '*Xcode*27.2*.app' -print -quit)"
+          if [[ -z "$XCODE_PATH" ]]; then
+            XCODE_PATH="/Applications/Xcode_27.2.app"
+          fi
+          test -d "$XCODE_PATH" || { echo "::error::Xcode 27.2 not found on runner"; exit 1; }
+          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
+          xcodebuild -version
+          [[ "$(xcodebuild -version | head -1)" == 'Xcode 27.2' ]] || { echo "::error::Expected Xcode 27.2"; exit 1; }
+          mkdir -p "$WORK/game" "$WORK/output"
+          echo "Workdir: $WORK"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install xcodegen zstd glslang
+          python3 -m venv "$WORK/venv"
+          "$WORK/venv/bin/python" -m pip install --upgrade pip
+          "$WORK/venv/bin/python" -m pip install lz4 'capstone>=5,<6' fonttools nsz zbic 'backports.zstd; python_version < "3.14"'
+          xcodebuild -downloadComponent MetalToolchain
+          dotnet --version || echo "::warning::dotnet not found; shader-related build steps might require it"
+          df -h /
+
+      - name: Download ROM ZIP (do not publish URL or archive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${ROM_ZIP_URL_INPUT:-$ROM_ZIP_URL_SECRET}"
+          if [[ -z "$URL" ]]; then
+            echo "::error::Specify rom_zip_url when running the workflow, or set ROM_ZIP_URL repository secret."
+            exit 1
+          fi
+          if [[ "$URL" != https://* ]]; then
+            echo "::error::Use an HTTPS URL."
+            exit 1
+          fi
+          # Never print the URL; signed URLs can contain credentials.
+          echo "::add-mask::$URL"
+          echo "Disk space before download:"
+          df -h /
+          curl --fail --location --retry 3 --retry-all-errors --connect-timeout 30 --silent --show-error \
+            --output "$WORK/rom.zip" "$URL"
+          ls -lh "$WORK/rom.zip"
+          echo "Disk space after download:"
+          df -h /
+
+      - name: Verify and unpack ROM ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$WORK/venv/bin/python" - <<'PY'
+          import os, zipfile, pathlib, sys
+          work = pathlib.Path(os.environ["WORK"])
+          z = work / "rom.zip"
+          with zipfile.ZipFile(z) as f:
+              files = f.infolist()
+              if any(n.filename.startswith("/") or ".." in pathlib.PurePosixPath(n.filename).parts or "\\" in n.filename for n in files):
+                  sys.exit("Unsafe archive paths")
+              uncompressed = sum(n.file_size for n in files)
+              compressed = z.stat().st_size
+              free = os.statvfs(work).f_bavail * os.statvfs(work).f_frsize
+              print(f"Entries: {len(files)}, uncompressed: {uncompressed/1e9:.2f} GB, free: {free/1e9:.2f} GB")
+              if free < uncompressed + 8_000_000_000:
+                  sys.exit("Insufficient disk space for extraction + 8 GB headroom. Try a larger runner.")
+          PY
+          # Apple's unzip is substantially faster than Python for large dumps with many small files.
+          /usr/bin/unzip -q "$WORK/rom.zip" -d "$WORK/game"
+          rm -f "$WORK/rom.zip"
+          # Accept both a normal dump root and an archive wrapped in one parent directory.
+          GAME_ROOT="$WORK/game"
+          if [[ ! -d "$GAME_ROOT/updates" && ! -d "$GAME_ROOT/base" && ! -d "$GAME_ROOT/exefs" ]]; then
+            mapfile -t dirs < <(find "$GAME_ROOT" -mindepth 1 -maxdepth 1 -type d)
+            if (( ${#dirs[@]} == 1 )); then GAME_ROOT="${dirs[0]}"; fi
+          fi
+          if [[ ! -d "$GAME_ROOT/updates" && ! -d "$GAME_ROOT/base" && ! -d "$GAME_ROOT/exefs" ]]; then
+            echo "::error::ZIP must contain nxnative dump layout: updates/<version>/exefs and romfs, or base/exefs and romfs."
+            exit 1
+          fi
+          echo "GAME_ROOT=$GAME_ROOT" >> "$GITHUB_ENV"
+          echo "Disk after extraction:"
+          df -h /
+          echo "Top-level folders:"
+          find "$GAME_ROOT" -mindepth 1 -maxdepth 2 -type d | head -30
+
+      - name: Clone nxnative
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$NXNATIVE_REF" https://github.com/seedds/nxnative.git "$WORK/nxnative" || {
+            git clone https://github.com/seedds/nxnative.git "$WORK/nxnative"
+            git -C "$WORK/nxnative" checkout "$NXNATIVE_REF"
+          }
+          git -C "$WORK/nxnative" rev-parse HEAD
+          df -h /
+
+      - name: Compile unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK/nxnative"
+          "$WORK/venv/bin/python" scripts/build_ipa_from_nsp.py "$GAME_ROOT" \
+            --platform ios \
+            --romfs "$ROMFS_MODE" \
+            --no-keep-extracted \
+            --progress lines \
+            --out "$WORK/output/game.ipa"
+          test -s "$WORK/output/game.ipa" || { echo "::error::Build did not output an IPA"; exit 1; }
+          ls -lh "$WORK/output/game.ipa"
+          df -h /
+
+      - name: Upload IPA only (ROM/ROMFS intentionally excluded)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxnative-unsigned-ipa
+          path: ${{ runner.temp }}/nxnative-url-build/output/*.ipa
+          if-no-files-found: error
+          retention-days: 1

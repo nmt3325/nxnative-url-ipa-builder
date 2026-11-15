@@ -1,0 +1,11 @@
+.DS_Store
+*.zip
+*.nup
+*.nsp
+*.xci
+*.nsz
+*.xcz
+*.ipa
+game/
+rom/
+output/
